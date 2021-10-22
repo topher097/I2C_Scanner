@@ -1,200 +1,215 @@
+// CODE MODIFIED FROM ADVANCED_SCANNER.INO ON I2C_T3 GITHUB //
+
 #include <Arduino.h>
-#include <Wire.h>  
+#include <SPI.h>
+#include <Bounce2.h>
+#include <U8g2lib.h>
+#include <i2c_t3.h>
 
+// OLED declaration
+U8G2_SSD1306_128X32_UNIVISION_F_SW_I2C g_OLED(U8G2_R0, 19, 18);
+int g_lineHeight = 0;
 
-// scans devices from 50 to 800KHz I2C speeds.
-// lower than 50 is not possible
-// DS3231 RTC works on 800 KHz. TWBR = 2; (?)
-long speed[] = {
-  50, 100, 200, 250, 400, 500, 800 };
-const int speeds = sizeof(speed)/sizeof(speed[0]);
+// BUTTON
+#define BUTTON_PIN 14
+Bounce b = Bounce();
+bool firstScan = false;
 
-// DELAY BETWEEN TESTS
-#define RESTORE_LATENCY  5    // for delay between tests of found devices.
-bool delayFlag = false;
+// BLINK LED
+#define BLINK 10              // blink LED pin
+IntervalTimer blinkTimer;
+int blinkDelay = 500;         // ms delay
+bool blinkState = false;      // init LED state to low/false
 
-// MINIMIZE OUTPUT
-bool printAll = true;
-bool header = true;
-
-// STATE MACHINE
-enum states {
-  STOP, ONCE, CONT, HELP };
-states state = STOP;
-
-uint32_t startScan;
-uint32_t stopScan;
-
-char getCommand()
-{
-  char c = '\0';
-  if (Serial.available())
-  {
-    c = Serial.read();
+// Blink status LED
+void blinkLED(){
+  if (blinkState){
+    blinkState = !blinkState;
   }
-  return c;
+  else {
+    blinkState = !blinkState;
+  }
+  digitalWrite(BLINK, blinkState);
 }
 
-void displayHelp()
-{
-  Serial.println(F("\nArduino I2C Scanner - 0.1.03\n"));
-  Serial.println(F("\ts = single scan"));
-  Serial.println(F("\tc = continuous scan - 1 second delay"));
-  Serial.println(F("\tq = quit continuous scan"));
-  Serial.println(F("\td = toggle latency delay between successful tests."));
-  Serial.println(F("\tp = toggle printAll - printFound."));
-  Serial.println(F("\th = toggle header - noHeader."));
-  Serial.println(F("\t? = help - this page"));
-  Serial.println();
+
+byte targetFound = 0;
+uint8_t found = 0;
+
+
+
+void updateOLED(){
+  g_OLED.clearDisplay();
+  g_OLED.setCursor(0, g_lineHeight);
+  if(!found){
+    g_OLED.print("No devices found");
+  }
+  else{
+    g_OLED.print("Found an address!");
+    g_OLED.setCursor(0, g_lineHeight*2);
+    g_OLED.printf("Addr: 0x%02X", targetFound);
+  }
+  
+  g_OLED.setCursor(0, g_lineHeight*3);
+  g_OLED.printf("Press button to scan");
+  g_OLED.sendBuffer();
 }
 
-void I2Cscan()
-{
-  startScan = millis();
-  uint8_t count = 0;
+#define TARGET_START 0x01
+#define TARGET_END   0x7F
 
-  if (header)
-  {
-    Serial.print(F("TIME\tDEC\tHEX\t"));
-    for (uint8_t s = 0; s < speeds; s++)
-    {
-      Serial.print(F("\t"));
-      Serial.print(speed[s]);
-    }
-    Serial.println(F("\t[KHz]"));
-    for (uint8_t s = 0; s < speeds + 5; s++)
-    {
-      Serial.print(F("--------"));
-    }
-    Serial.println();
-  }
+#define WIRE_PINS   I2C_PINS_18_19
+#if defined(__MKL26Z64__)               // LC
+#define WIRE1_PINS   I2C_PINS_22_23
+#endif
+#if defined(__MK20DX256__)              // 3.1-3.2
+#define WIRE1_PINS   I2C_PINS_29_30
+#endif
+#if defined(__MK64FX512__) || defined(__MK66FX1M0__)  // 3.5/3.6
+#define WIRE1_PINS   I2C_PINS_37_38
+#define WIRE2_PINS   I2C_PINS_3_4
+#endif
+#if defined(__MK66FX1M0__)              // 3.6
+#define WIRE3_PINS   I2C_PINS_56_57
+#endif
 
-  // TEST
-  // 0.1.04: tests only address range 8..120
-  // --------------------------------------------
-  // Address  R/W Bit Description
-  // 0000 000   0 General call address
-  // 0000 000   1 START byte
-  // 0000 001   X CBUS address
-  // 0000 010   X reserved - different bus format
-  // 0000 011   X reserved - future purposes
-  // 0000 1XX   X High Speed master code
-  // 1111 1XX   X reserved - future purposes
-  // 1111 0XX   X 10-bit slave addressing
-  for (uint8_t address = 8; address < 127; address++)
-  {
-    bool printLine = printAll;
-    bool found[speeds];
-    bool fnd = false;
 
-    for (uint8_t s = 0; s < speeds ; s++)
-    {
-      TWBR = (F_CPU/(speed[s]*1000) - 16)/2;
-      Wire.beginTransmission (address);
-      found[s] = (Wire.endTransmission () == 0);
-      fnd |= found[s];
-      // give device 5 millis
-      if (fnd && delayFlag) delay(RESTORE_LATENCY);
-    }
+// -------------------------------------------------------------------------------------------
+// Function prototypes
+void scan_bus(i2c_t3& Wire, uint8_t all);
+void print_bus_status(i2c_t3& Wire);
+void print_scan_status(struct i2cStruct* i2c, uint8_t target, uint8_t& found, uint8_t all);
 
-    if (fnd) count++;
-    printLine |= fnd;
-
-    if (printLine)
-    {
-      Serial.print(millis());
-      Serial.print(F("\t"));
-      Serial.print(address, DEC);
-      Serial.print(F("\t0x"));
-      Serial.print(address, HEX);
-      Serial.print(F("\t"));
-
-      for (uint8_t s = 0; s < speeds ; s++)
-      {
-        Serial.print(F("\t"));
-        Serial.print(found[s]? F("V"):F("."));
-      }
-      Serial.println();
-    }
-  }
-
-  stopScan = millis();
-  if (header)
-  {
-    Serial.println();
-    Serial.print(count);
-    Serial.print(F(" devices found in "));
-    Serial.print(stopScan - startScan);
-    Serial.println(F(" milliseconds."));
-  }
-}
-
+// -------------------------------------------------------------------------------------------
 void setup()
 {
-  Serial.begin(9600);
-  Wire.begin();
-  while (!Serial){}
-  Serial.println("Ready");
-  displayHelp();
+  // Power for I2C device
+  pinMode(2, HIGH);
+  pinMode(3, LOW);
+
+  // Setup for Master mode, all buses, external pullups, 400kHz, 10ms default timeout
+  //
+  Wire.begin(I2C_MASTER, 0x00, WIRE_PINS, I2C_PULLUP_EXT, 400000);
+  Wire.setDefaultTimeout(10000); // 10ms
+  #if I2C_BUS_NUM >= 2
+  Wire1.begin(I2C_MASTER, 0x00, WIRE1_PINS, I2C_PULLUP_EXT, 400000);
+  Wire1.setDefaultTimeout(10000); // 10ms
+  #endif
+
+  // Begin serial
+  Serial.begin(115200);
+
+  // Button setup
+  pinMode(BUTTON_PIN, INPUT);
+  b.attach(BUTTON_PIN, INPUT_PULLUP);
+  b.interval(25);
+
+  // Start blink timer
+  pinMode(BLINK, OUTPUT);
+  blinkTimer.begin(blinkLED, blinkDelay*1000);
+  blinkTimer.priority(1);
+
+  // OLED setup
+  g_OLED.begin();
+  g_OLED.clear();
+  g_OLED.setFont(u8g2_font_profont12_tf);
+  g_lineHeight = g_OLED.getFontAscent() - g_OLED.getFontDescent();
+  g_OLED.setCursor(0, g_lineHeight*2);
+  g_OLED.print("Press button to scan");
+  g_OLED.sendBuffer();
 }
 
 
+// -------------------------------------------------------------------------------------------
 void loop()
 {
-  switch (getCommand())
-  {
-  case 's':
-    state = ONCE;
-    break;
-  case 'c':
-    state = CONT;
-    break;
-  case 'd':
-    delayFlag = !delayFlag;
-    Serial.print(F("<delay="));
-    Serial.println(delayFlag?F("5>"):F("0>"));
-    break;
-  case 'e':
-    // eeprom test TODO
-    break;
-  case 'h':
-    header = !header;
-    Serial.print(F("<header="));
-    Serial.println(header?F("yes>"):F("no>"));
-    break;
-  case '?':
-    state = HELP;
-    break;
-  case 'p':
-    printAll = !printAll;
-    Serial.print(F("<print="));
-    Serial.println(printAll?F("all>"):F("found>"));
-    break;
-  case 'q':
-    state = HELP;
-    break;
-  default:
-    break;
-  }
+  // Scan I2C addresses
+  //
+  b.update();
+  if (b.fell()){
+    uint8_t all = 0;
 
-  switch (state)
-  {
-  case ONCE:
-    I2Cscan();
-    state = HELP;
-    break;
-  case CONT:
-    I2Cscan();
-    delay(1000);
-    break;   
-  case HELP:
-    displayHelp();
-    state = STOP;
-    break;
-  case STOP:
-    break;
-  default: // ignore all non commands
-    break;
+    Serial.print("---------------------------------------------------\n");
+    Serial.print("Bus Status Summary\n");
+    Serial.print("==================\n");
+    Serial.print(" Bus    Mode   SCL  SDA   Pullup   Clock\n");
+    print_bus_status(Wire);
+    #if I2C_BUS_NUM >= 2
+    print_bus_status(Wire1);
+    #endif
+
+    scan_bus(Wire, all);
+    #if I2C_BUS_NUM >= 2
+    scan_bus(Wire1, all);
+    updateOLED();             // only display Wire1 bus address
+    #endif
+
+    Serial.print("---------------------------------------------------\n\n\n");
+
+    delay(500); // delay to space out tests
   }
 }
 
+// -------------------------------------------------------------------------------------------
+// scan bus
+//
+void scan_bus(i2c_t3& Wire, uint8_t all)
+{
+    uint8_t target = 0;
+    found = 0;
+    targetFound = 0;
+    
+    Serial.print("---------------------------------------------------\n");
+    if(Wire.bus == 0)
+        Serial.print("Starting scan: Wire\n");
+    else
+        Serial.printf("Starting scan: Wire%d\n",Wire.bus);
+    
+    for(target = TARGET_START; target <= TARGET_END; target++) // sweep addr, skip general call
+    {
+        Wire.beginTransmission(target);       // slave addr
+        Wire.endTransmission();               // no data, just addr
+        print_scan_status(Wire.i2c, target, found, all);
+    }
+    
+    if(!found) Serial.print("No devices found.\n");
+}
+
+// -------------------------------------------------------------------------------------------
+// print bus status
+//
+void print_bus_status(i2c_t3& Wire)
+{
+    struct i2cStruct* i2c = Wire.i2c;
+    if(Wire.bus == 0)
+        Serial.print("Wire   ");
+    else
+        Serial.printf("Wire%d  ",Wire.bus);
+    switch(i2c->currentMode)
+    {
+    case I2C_MASTER: Serial.print("MASTER  "); break;
+    case I2C_SLAVE:  Serial.print(" SLAVE  "); break;
+    }
+    Serial.printf(" %2d   %2d  ", Wire.i2c->currentSCL, Wire.i2c->currentSDA);
+    switch(i2c->currentPullup)
+    {
+    case I2C_PULLUP_EXT: Serial.print("External  "); break;
+    case I2C_PULLUP_INT: Serial.print("Internal  "); break;
+    }
+    Serial.printf("%d Hz\n",i2c->currentRate);
+}
+
+// -------------------------------------------------------------------------------------------
+// print scan status
+//
+void print_scan_status(struct i2cStruct* i2c, uint8_t target, uint8_t& found, uint8_t all)
+{
+    switch(i2c->currentStatus)
+    {
+    case I2C_WAITING:  Serial.printf("Addr: 0x%02X ACK\n",target); found=1; targetFound = target; break;
+    case I2C_ADDR_NAK: if(all) { Serial.printf("Addr: 0x%02X\n",target); } break;
+    case I2C_TIMEOUT:  if(all) { Serial.printf("Addr: 0x%02X Timeout\n",target); } break;
+    default: break;
+    }
+
+}
